@@ -33,6 +33,7 @@
 #include <linux/module.h>
 #include <linux/spi/spi.h>
 #include <linux/w1-gpio.h>
+#include <linux/gpio.h>
 
 #include <linux/version.h>
 #include <linux/clkdev.h>
@@ -56,6 +57,8 @@
 
 #include <linux/delay.h>
 
+#include <linux/ssr_plug.h>
+
 #include "bcm2708.h"
 #include "armctrl.h"
 #include "clock.h"
@@ -78,7 +81,7 @@
 #define DMA_MASK_BITS_COMMON 32
 
 // use GPIO 4 for the one-wire GPIO pin, if enabled
-#define W1_GPIO 4
+#define W1_GPIO 23
 // ensure one-wire GPIO pullup is disabled by default
 #define W1_PULLUP -1
 
@@ -696,6 +699,38 @@ static struct i2c_board_info __initdata snd_pcm512x_i2c_devices[] = {
 };
 #endif
 
+#define SSR_PLUG_CNT 3
+
+static volatile struct ssr_plug_config_entry bcm2835_ssr_plug_entries[] = {
+    {
+    .gpio = 11,
+    .power = 0,
+    .gpioval = 0,
+    }, {
+    .gpio = 9,
+    .power = 0,
+    .gpioval = 0,
+    }, {
+    .gpio = 10,
+    .power = 0,
+    .gpioval = 0,
+    },
+};
+
+static struct ssr_plug_config bcm2835_ssr_plug_pdata = {
+    .plugCnt = SSR_PLUG_CNT,
+    .ssr_plug_config = bcm2835_ssr_plug_entries,
+    .initialized = 0,
+};
+
+static struct platform_device bcm2835_ssr_plug_device = {
+    .name = SSR_PLUG_DRIVER_NAME,
+    .id   = 0,
+    .dev	= {
+        .platform_data	= &bcm2835_ssr_plug_pdata,
+    },
+};
+
 int __init bcm_register_device(struct platform_device *pdev)
 {
 	int ret;
@@ -851,6 +886,8 @@ void __init bcm2708_init(void)
 	system_rev = boardrev;
 	system_serial_low = serial;
 
+	platform_device_register(&bcm2835_ssr_plug_device);
+
 #ifdef CONFIG_BCM2708_SPIDEV
 	spi_register_board_info(bcm2708_spi_devices,
 			ARRAY_SIZE(bcm2708_spi_devices));
@@ -899,14 +936,74 @@ static struct clock_event_device timer0_clockevent = {
 	.set_next_event = timer_set_next_event,
 };
 
+static inline void handleSSR(void)
+{
+    int i;
+    static int ssr_percentCnt = 0;
+
+    ssr_percentCnt++;
+
+    if(ssr_percentCnt == 100)
+    {
+        ssr_percentCnt = 0;
+
+        for (i=0; i<SSR_PLUG_CNT; i++)
+        {
+            if(bcm2835_ssr_plug_entries[i].power == -1 || bcm2835_ssr_plug_entries[i].power == 0)
+            {
+                gpio_set_value(bcm2835_ssr_plug_entries[i].gpio, 0);
+                bcm2835_ssr_plug_entries[i].gpioval = 0;
+            }
+            else
+            {
+                gpio_set_value(bcm2835_ssr_plug_entries[i].gpio, 1);
+                bcm2835_ssr_plug_entries[i].gpioval = 1;
+            }
+        }
+    }
+    else
+    {
+        for (i=0; i<SSR_PLUG_CNT; i++)
+        {
+            if(ssr_percentCnt >= bcm2835_ssr_plug_entries[i].power)
+            {
+                if(bcm2835_ssr_plug_entries[i].gpioval == 1)
+                {
+                    gpio_set_value(bcm2835_ssr_plug_entries[i].gpio, 0);
+                    bcm2835_ssr_plug_entries[i].gpioval = 0;
+                }
+            }
+            else
+            {
+                if(bcm2835_ssr_plug_entries[i].gpioval == 0)
+                {
+                    gpio_set_value(bcm2835_ssr_plug_entries[i].gpio, 1);
+                    bcm2835_ssr_plug_entries[i].gpioval = 1;
+                }
+            }
+        }
+    }
+}
+
 /*
  * IRQ handler for the timer
  */
 static irqreturn_t bcm2708_timer_interrupt(int irq, void *dev_id)
 {
 	struct clock_event_device *evt = &timer0_clockevent;
+    static int divcnt = 0;
 
 	writel(1 << 3, __io_address(ST_BASE + 0x00));	/* stcs clear timer int */
+
+    if(bcm2835_ssr_plug_pdata.initialized)
+    {
+        divcnt++;
+        if(divcnt == SSR_INT_DIV)
+        {
+            handleSSR();
+            divcnt = 0;
+        }
+    }
 
 	evt->event_handler(evt);
 
